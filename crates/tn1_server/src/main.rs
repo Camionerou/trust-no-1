@@ -7,16 +7,23 @@ mod physics;
 mod world;
 mod systems;
 mod networking;
+mod database;
 
 use physics::ServerPhysicsPlugin;
 use world::WorldPlugin;
 use systems::SystemsPlugin;
 use networking::NetworkingPlugin;
+use database::DatabasePlugin;
 
 fn main() {
-    // Configurar logging - solo errores y warnings críticos
+    // Cargar variables de entorno
+    dotenv::dotenv().ok();
+    
+    // Configurar logging
+    let log_level = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "warn,tn1_server=info".to_string());
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_env_filter(log_level)
         .init();
     
     println!("🚀 Iniciando servidor Trust-No-1...");
@@ -30,6 +37,7 @@ fn main() {
         .add_event::<PlayerSpawnEvent>()
         .add_event::<PlayerDespawnEvent>()
         .add_plugins((
+            DatabasePlugin,
             ServerPhysicsPlugin,
             NetworkingPlugin,
             WorldPlugin,

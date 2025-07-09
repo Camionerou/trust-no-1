@@ -9,10 +9,25 @@ pub const TICK_RATE: u32 = 60;
 /// Mensajes que el cliente envía al servidor
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientMessage {
-    /// Cliente solicita conectarse
-    Connect { 
+    /// Cliente solicita conectarse (nuevo jugador)
+    Register { 
         protocol_version: u32,
-        player_name: String,
+        username: String,
+        password: String,
+        email: Option<String>,
+    },
+    
+    /// Cliente solicita conectarse (jugador existente)
+    Login { 
+        protocol_version: u32,
+        username: String,
+        password: String,
+    },
+    
+    /// Cliente se reconecta con token de sesión
+    Reconnect {
+        protocol_version: u32,
+        session_token: String,
     },
     
     /// Input del jugador
@@ -35,6 +50,19 @@ pub enum ServerMessage {
     Connected {
         player_id: PlayerId,
         tick_rate: u32,
+        session_token: String,
+        spawn_position: Vec3,
+    },
+    
+    /// Registro exitoso
+    Registered {
+        player_id: PlayerId,
+        session_token: String,
+    },
+    
+    /// Error de autenticación
+    AuthError {
+        reason: String,
     },
     
     /// Estado completo del mundo (snapshot)

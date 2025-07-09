@@ -127,30 +127,43 @@ fn handle_client_connection(
                         // Tenemos un mensaje completo
                         if let Ok(json_str) = std::str::from_utf8(&message_buffer[4..4 + msg_len]) {
                             if let Ok(msg) = serde_json::from_str::<ClientMessage>(json_str) {
-                                // Si es Connect, agregarlo a la lista de clientes
-                                if let ClientMessage::Connect { player_name, protocol_version } = &msg {
-                                    if *protocol_version != PROTOCOL_VERSION {
-                                        // Versión incorrecta
-                                        let error = ServerMessage::ConnectionError {
-                                            reason: format!("Versión de protocolo incorrecta. Servidor: {}, Cliente: {}", 
-                                                PROTOCOL_VERSION, protocol_version)
+                                // Manejar mensajes de autenticación
+                                match &msg {
+                                    ClientMessage::Login { protocol_version, username, .. } |
+                                    ClientMessage::Register { protocol_version, username, .. } |
+                                    ClientMessage::Reconnect { protocol_version, .. } => {
+                                        if *protocol_version != PROTOCOL_VERSION {
+                                            // Versión incorrecta
+                                            let error = ServerMessage::ConnectionError {
+                                                reason: format!("Versión de protocolo incorrecta. Servidor: {}, Cliente: {}", 
+                                                    PROTOCOL_VERSION, protocol_version)
+                                            };
+                                            send_message_to_stream(&mut stream, &error);
+                                            break;
+                                        }
+                                        
+                                        // Extraer nombre de usuario
+                                        let player_name = match &msg {
+                                            ClientMessage::Login { username, .. } |
+                                            ClientMessage::Register { username, .. } => username.clone(),
+                                            ClientMessage::Reconnect { session_token, .. } => format!("Player_{}", client_id),
+                                            _ => unreachable!(),
                                         };
-                                        send_message_to_stream(&mut stream, &error);
-                                        break;
+                                        
+                                        // Agregar cliente
+                                        let mut clients_lock = clients.lock().unwrap();
+                                        clients_lock.insert(client_id, ClientConnection {
+                                            stream: stream.try_clone().unwrap(),
+                                            player_entity: None,
+                                            player_id: None,
+                                            player_name: player_name.clone(),
+                                            last_ping: Instant::now(),
+                                        });
+                                        drop(clients_lock);
+                                        
+                                        println!("✅ Cliente {} conectado: {}", client_id, player_name);
                                     }
-                                    
-                                    // Agregar cliente
-                                    let mut clients_lock = clients.lock().unwrap();
-                                    clients_lock.insert(client_id, ClientConnection {
-                                        stream: stream.try_clone().unwrap(),
-                                        player_entity: None,
-                                        player_id: None,
-                                        player_name: player_name.clone(),
-                                        last_ping: Instant::now(),
-                                    });
-                                    drop(clients_lock);
-                                    
-                                    println!("✅ Cliente {} conectado: {}", client_id, player_name);
+                                    _ => {}
                                 }
                                 
                                 // Agregar mensaje a la cola
@@ -190,45 +203,16 @@ fn process_client_messages(
     
     for (client_id, message) in messages {
         match message {
-            ClientMessage::Connect { player_name, .. } => {
-                // Crear entidad del jugador
-                let player_id = PlayerId(uuid::Uuid::new_v4());
-                let entity = commands.spawn((
-                    Player,
-                    player_id,
-                    PlayerController::new(),
-                    Health::new(100.0),
-                    Transform::from_xyz(0.0, 1.0, 0.0),
-                    GlobalTransform::default(),
-                )).id();
-                
-                // Actualizar cliente con entidad
-                let mut clients = server_state.clients.lock().unwrap();
-                if let Some(client) = clients.get_mut(&client_id) {
-                    client.player_entity = Some(entity);
-                    client.player_id = Some(player_id);
-                    
-                    // Enviar confirmación
-                    let connected_msg = ServerMessage::Connected {
-                        player_id,
-                        tick_rate: TICK_RATE,
-                    };
-                    send_message_to_stream(&mut client.stream, &connected_msg);
-                    
-                    println!("🎮 Jugador creado - Cliente: {}, PlayerId: {:?}", client_id, player_id);
-                    
-                    // Notificar a otros clientes
-                    let join_msg = ServerMessage::PlayerJoined {
-                        player_id,
-                        position: Vec3::new(0.0, 1.0, 0.0),
-                    };
-                    
-                    for (&other_id, other_client) in clients.iter_mut() {
-                        if other_id != client_id && other_client.player_id.is_some() {
-                            send_message_to_stream(&mut other_client.stream, &join_msg);
-                        }
-                    }
-                }
+            // Temporalmente manejar los tres tipos de autenticación hasta actualizar cliente
+            ClientMessage::Login { username, password, .. } => {
+                handle_auth(&mut commands, &server_state, client_id, username, Some(password), None);
+            }
+            ClientMessage::Register { username, password, .. } => {
+                handle_auth(&mut commands, &server_state, client_id, username, Some(password), None);
+            }
+            ClientMessage::Reconnect { session_token, .. } => {
+                let username = format!("Player_{}", client_id);
+                handle_auth(&mut commands, &server_state, client_id, username, None, Some(session_token));
             }
             
             ClientMessage::PlayerInput { input, .. } => {
@@ -394,5 +378,62 @@ fn send_message_to_stream(stream: &mut TcpStream, message: &ServerMessage) {
         let mut data = len.to_be_bytes().to_vec();
         data.extend(json.as_bytes());
         let _ = stream.write_all(&data);
+    }
+}
+
+fn handle_auth(
+    commands: &mut Commands,
+    server_state: &ServerState,
+    client_id: u32,
+    username: String,
+    password: Option<String>,
+    session_token: Option<String>,
+) {
+    // Por ahora simulamos login exitoso sin verificar DB
+    // TODO: Integrar con database para verificación real
+    let player_id = PlayerId(uuid::Uuid::new_v4());
+    let spawn_pos = Vec3::new(0.0, 10.0, 0.0);
+    
+    let entity = commands.spawn((
+        Player,
+        player_id,
+        PlayerController::new(),
+        Health::new(100.0),
+        Transform::from_translation(spawn_pos),
+        GlobalTransform::default(),
+    )).id();
+    
+    // Actualizar cliente con entidad
+    let mut clients = server_state.clients.lock().unwrap();
+    if let Some(client) = clients.get_mut(&client_id) {
+        client.player_entity = Some(entity);
+        client.player_id = Some(player_id);
+        client.player_name = username;
+        
+        // Generar token de sesión temporal
+        let session_token = format!("temp_token_{}", client_id);
+        
+        // Enviar confirmación con nueva estructura
+        let connected_msg = ServerMessage::Connected {
+            player_id,
+            tick_rate: TICK_RATE,
+            session_token,
+            spawn_position: spawn_pos,
+        };
+        send_message_to_stream(&mut client.stream, &connected_msg);
+        
+        println!("🎮 Jugador autenticado - Cliente: {}, PlayerId: {:?}", client_id, player_id);
+        
+        // Notificar a otros clientes
+        let join_msg = ServerMessage::PlayerJoined {
+            player_id,
+            position: spawn_pos,
+        };
+        
+        for (&other_id, other_client) in clients.iter_mut() {
+            if other_id != client_id && other_client.player_id.is_some() {
+                send_message_to_stream(&mut other_client.stream, &join_msg);
+            }
+        }
     }
 }

@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tn1_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trustno1
+      POSTGRES_USER: tn1_admin
+      POSTGRES_PASSWORD: tn1_dev_password_2024
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tn1_admin -d trustno1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: tn1_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass tn1_redis_dev_2024
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # pgAdmin para desarrollo (opcional)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: tn1_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@trustno1.local
+      PGADMIN_DEFAULT_PASSWORD: pgadmin_dev_2024
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    profiles:
+      - dev
+
+volumes:
+  postgres_data:
+    name: tn1_postgres_data
+  redis_data:
+    name: tn1_redis_data
