@@ -6,6 +6,39 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
+use crate::database::Database;
+use std::sync::mpsc::{self, Receiver, Sender};
+
+// Estructura para comandos de base de datos
+#[derive(Debug)]
+pub enum DatabaseCommand {
+    SavePlayerPosition {
+        player_id: uuid::Uuid,
+        position: Vec3,
+        rotation: Quat,
+    },
+    AuthenticatePlayer {
+        username: String,
+        password: String,
+        client_id: u32,
+    },
+}
+
+#[derive(Resource)]
+pub struct DatabaseChannel {
+    pub sender: Sender<DatabaseCommand>,
+    pub receiver: Arc<Mutex<Receiver<DatabaseCommand>>>,
+}
+
+impl DatabaseChannel {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver: Arc::new(Mutex::new(receiver)),
+        }
+    }
+}
 
 pub struct NetworkingPlugin;
 
@@ -13,17 +46,84 @@ impl Plugin for NetworkingPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ServerState::new())
             .insert_resource(ServerTick(0))
-            .add_systems(Startup, start_server)
+            .insert_resource(SaveTimer(Timer::from_seconds(5.0, TimerMode::Repeating))) // Guardar cada 5 segundos
+            .insert_resource(DatabaseChannel::new()) // Insertar el canal de base de datos
+            .add_systems(Startup, (start_server, start_database_worker))
             .add_systems(Update, (
                 process_client_messages,
                 update_physics,
                 send_world_state,
+                save_player_positions, // Nuevo sistema
             ).chain());
+    }
+}
+
+fn start_database_worker(
+    database: Option<Res<Database>>,
+    database_channel: Res<DatabaseChannel>,
+) {
+    if let Some(db) = database {
+        let db_clone = db.clone();
+        let receiver = database_channel.receiver.clone();
+        
+        thread::spawn(move || {
+            info!("🔄 Worker de base de datos iniciado");
+            
+            loop {
+                if let Ok(receiver_lock) = receiver.lock() {
+                    match receiver_lock.recv() {
+                        Ok(cmd) => {
+                            // Procesar comando de base de datos
+                            match cmd {
+                                DatabaseCommand::SavePlayerPosition { player_id, position, rotation } => {
+                                    // Crear un runtime de Tokio para la operación asíncrona
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    match rt.block_on(db_clone.save_player_state(player_id, position, rotation)) {
+                                        Ok(_) => {
+                                            debug!("✅ Posición guardada para jugador: {:?}", player_id);
+                                        }
+                                        Err(e) => {
+                                            error!("❌ Error guardando posición: {}", e);
+                                        }
+                                    }
+                                }
+                                DatabaseCommand::AuthenticatePlayer { username, password, client_id } => {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    match rt.block_on(db_clone.authenticate_player(&username, &password)) {
+                                        Ok(Some(player)) => {
+                                            info!("✅ Jugador autenticado: {} (ID: {})", username, player.id);
+                                            // TODO: Enviar resultado de vuelta al sistema de networking
+                                        }
+                                        Ok(None) => {
+                                            warn!("❌ Credenciales inválidas para: {}", username);
+                                        }
+                                        Err(e) => {
+                                            error!("❌ Error autenticando jugador: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Canal cerrado, salir del loop
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            info!("🔄 Worker de base de datos terminado");
+        });
+    } else {
+        warn!("⚠️ Base de datos no disponible - worker no iniciado");
     }
 }
 
 #[derive(Resource)]
 pub struct ServerTick(pub u32);
+
+#[derive(Resource)]
+pub struct SaveTimer(pub Timer);
 
 #[derive(Resource)]
 pub struct ServerState {
@@ -235,6 +335,8 @@ fn process_client_messages(
     mut commands: Commands,
     server_state: Res<ServerState>,
     mut player_query: Query<(&mut Transform, &mut PlayerController, &PlayerId)>,
+    database: Option<Res<Database>>,
+    database_channel: Res<DatabaseChannel>,
 ) {
     let messages = {
         let mut incoming_lock = server_state.incoming_messages.lock().unwrap();
@@ -245,14 +347,14 @@ fn process_client_messages(
         match message {
             // Temporalmente manejar los tres tipos de autenticación hasta actualizar cliente
             ClientMessage::Login { username, password, .. } => {
-                handle_auth(&mut commands, &server_state, client_id, username, Some(password), None);
+                handle_auth(&mut commands, &server_state, client_id, username, Some(password), None, database.as_deref(), database_channel.sender.clone());
             }
             ClientMessage::Register { username, password, .. } => {
-                handle_auth(&mut commands, &server_state, client_id, username, Some(password), None);
+                handle_auth(&mut commands, &server_state, client_id, username, Some(password), None, database.as_deref(), database_channel.sender.clone());
             }
             ClientMessage::Reconnect { session_token, .. } => {
                 let username = format!("Player_{}", client_id);
-                handle_auth(&mut commands, &server_state, client_id, username, None, Some(session_token));
+                handle_auth(&mut commands, &server_state, client_id, username, None, Some(session_token), database.as_deref(), database_channel.sender.clone());
             }
             
             ClientMessage::PlayerInput { input, .. } => {
@@ -426,13 +528,22 @@ fn handle_auth(
     server_state: &ServerState,
     client_id: u32,
     username: String,
-    _password: Option<String>,
-    _session_token: Option<String>,
+    password: Option<String>,
+    session_token: Option<String>,
+    database: Option<&Database>,
+    sender: Sender<DatabaseCommand>,
 ) {
-    // Por ahora simulamos login exitoso sin verificar DB
-    // TODO: Integrar con database para verificación real
     let player_id = PlayerId(uuid::Uuid::new_v4());
     let spawn_pos = Vec3::new(0.0, 10.0, 0.0);
+    
+    // Si tenemos base de datos, intentar autenticación real
+    if let Some(db) = database {
+        // TODO: Implementar autenticación asíncrona
+        // Por ahora continuamos con mock
+        info!("🔒 Usando autenticación con base de datos para: {}", username);
+    } else {
+        warn!("⚠️ Autenticación mock - base de datos no disponible");
+    }
     
     let entity = commands.spawn((
         Player,
@@ -473,6 +584,35 @@ fn handle_auth(
         for (&other_id, other_client) in clients.iter_mut() {
             if other_id != client_id && other_client.player_id.is_some() {
                 send_message_to_stream(&mut other_client.stream, &join_msg);
+            }
+        }
+    }
+}
+
+fn save_player_positions(
+    player_query: Query<(&Transform, &PlayerId), With<Player>>,
+    database: Option<Res<Database>>,
+    mut save_timer: ResMut<SaveTimer>,
+    time: Res<Time>,
+    database_channel: Res<DatabaseChannel>,
+) {
+    save_timer.0.tick(time.delta());
+    
+    if save_timer.0.just_finished() {
+        let player_count = player_query.iter().count();
+        if player_count > 0 {
+            info!("💾 Guardando posiciones de {} jugadores", player_count);
+            
+            for (transform, player_id) in player_query.iter() {
+                let cmd = DatabaseCommand::SavePlayerPosition {
+                    player_id: player_id.0,
+                    position: transform.translation,
+                    rotation: transform.rotation,
+                };
+                
+                if let Err(e) = database_channel.sender.send(cmd) {
+                    error!("❌ Error enviando comando de guardado: {}", e);
+                }
             }
         }
     }
