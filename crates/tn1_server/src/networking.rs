@@ -129,8 +129,54 @@ fn handle_client_connection(
                             if let Ok(msg) = serde_json::from_str::<ClientMessage>(json_str) {
                                 // Manejar mensajes de autenticación
                                 match &msg {
-                                    ClientMessage::Login { protocol_version, username, .. } |
-                                    ClientMessage::Register { protocol_version, username, .. } |
+                                    ClientMessage::Login { protocol_version, username, .. } => {
+                                        if *protocol_version != PROTOCOL_VERSION {
+                                            // Versión incorrecta
+                                            let error = ServerMessage::ConnectionError {
+                                                reason: format!("Versión de protocolo incorrecta. Servidor: {}, Cliente: {}", 
+                                                    PROTOCOL_VERSION, protocol_version)
+                                            };
+                                            send_message_to_stream(&mut stream, &error);
+                                            break;
+                                        }
+                                        
+                                        // Agregar cliente
+                                        let mut clients_lock = clients.lock().unwrap();
+                                        clients_lock.insert(client_id, ClientConnection {
+                                            stream: stream.try_clone().unwrap(),
+                                            player_entity: None,
+                                            player_id: None,
+                                            player_name: username.clone(),
+                                            last_ping: Instant::now(),
+                                        });
+                                        drop(clients_lock);
+                                        
+                                        println!("✅ Cliente {} conectado: {}", client_id, username);
+                                    }
+                                    ClientMessage::Register { protocol_version, username, .. } => {
+                                        if *protocol_version != PROTOCOL_VERSION {
+                                            // Versión incorrecta
+                                            let error = ServerMessage::ConnectionError {
+                                                reason: format!("Versión de protocolo incorrecta. Servidor: {}, Cliente: {}", 
+                                                    PROTOCOL_VERSION, protocol_version)
+                                            };
+                                            send_message_to_stream(&mut stream, &error);
+                                            break;
+                                        }
+                                        
+                                        // Agregar cliente
+                                        let mut clients_lock = clients.lock().unwrap();
+                                        clients_lock.insert(client_id, ClientConnection {
+                                            stream: stream.try_clone().unwrap(),
+                                            player_entity: None,
+                                            player_id: None,
+                                            player_name: username.clone(),
+                                            last_ping: Instant::now(),
+                                        });
+                                        drop(clients_lock);
+                                        
+                                        println!("✅ Cliente {} conectado: {}", client_id, username);
+                                    }
                                     ClientMessage::Reconnect { protocol_version, .. } => {
                                         if *protocol_version != PROTOCOL_VERSION {
                                             // Versión incorrecta
@@ -142,13 +188,7 @@ fn handle_client_connection(
                                             break;
                                         }
                                         
-                                        // Extraer nombre de usuario
-                                        let player_name = match &msg {
-                                            ClientMessage::Login { username, .. } |
-                                            ClientMessage::Register { username, .. } => username.clone(),
-                                            ClientMessage::Reconnect { session_token, .. } => format!("Player_{}", client_id),
-                                            _ => unreachable!(),
-                                        };
+                                        let player_name = format!("Player_{}", client_id);
                                         
                                         // Agregar cliente
                                         let mut clients_lock = clients.lock().unwrap();
@@ -161,7 +201,7 @@ fn handle_client_connection(
                                         });
                                         drop(clients_lock);
                                         
-                                        println!("✅ Cliente {} conectado: {}", client_id, player_name);
+                                        println!("✅ Cliente {} reconectado: {}", client_id, player_name);
                                     }
                                     _ => {}
                                 }
@@ -386,8 +426,8 @@ fn handle_auth(
     server_state: &ServerState,
     client_id: u32,
     username: String,
-    password: Option<String>,
-    session_token: Option<String>,
+    _password: Option<String>,
+    _session_token: Option<String>,
 ) {
     // Por ahora simulamos login exitoso sin verificar DB
     // TODO: Integrar con database para verificación real

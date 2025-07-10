@@ -50,18 +50,24 @@ fn connect_to_server(mut client: ResMut<NetworkClient>) {
     match TcpStream::connect(format!("127.0.0.1:{}", DEFAULT_PORT)) {
         Ok(stream) => {
             stream.set_nodelay(true).ok();
+            stream.set_nonblocking(true).ok(); // Configurar como no-bloqueante
             
             let stream_arc = Arc::new(Mutex::new(stream));
             client.stream = Some(stream_arc.clone());
             
-            // Enviar mensaje de conexión
-            let connect_msg = ClientMessage::Connect {
+            // Enviar mensaje de login (por ahora hardcodeado)
+            // TODO: Agregar UI de login/registro
+            let connect_msg = ClientMessage::Login {
                 protocol_version: PROTOCOL_VERSION,
-                player_name: "Jugador".to_string(), // TODO: configurar nombre
+                username: format!("Player{}", rand::random::<u16>()),
+                password: "temp_password".to_string(),
             };
             
             if let Ok(mut stream_lock) = stream_arc.lock() {
-                send_client_message(&mut *stream_lock, &connect_msg);
+                if let Err(e) = send_client_message(&mut *stream_lock, &connect_msg) {
+                    error!("❌ Error enviando mensaje de login: {}", e);
+                    return;
+                }
             }
             
             // Thread para recibir mensajes
@@ -90,7 +96,10 @@ fn receive_server_messages(
     loop {
         let mut stream_lock = match stream.lock() {
             Ok(lock) => lock,
-            Err(_) => break,
+            Err(_) => {
+                error!("❌ Error obteniendo lock del stream");
+                break;
+            }
         };
         
         match stream_lock.read(&mut buffer) {
@@ -113,8 +122,15 @@ fn receive_server_messages(
                     if message_buffer.len() >= 4 + msg_len {
                         // Mensaje completo
                         if let Ok(json_str) = std::str::from_utf8(&message_buffer[4..4 + msg_len]) {
-                            if let Ok(msg) = serde_json::from_str::<ServerMessage>(json_str) {
-                                incoming.lock().unwrap().push(msg);
+                            match serde_json::from_str::<ServerMessage>(json_str) {
+                                Ok(msg) => {
+                                    if let Ok(mut incoming_lock) = incoming.lock() {
+                                        incoming_lock.push(msg);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("⚠️ Error deserializando mensaje: {}", e);
+                                }
                             }
                         }
                         
@@ -125,8 +141,10 @@ fn receive_server_messages(
                 }
             }
             Err(e) => {
-                if e.kind() != std::io::ErrorKind::WouldBlock {
-                    error!("Error leyendo del servidor: {}", e);
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    // No hay datos disponibles, continuar
+                } else {
+                    error!("❌ Error leyendo del servidor: {}", e);
                     break;
                 }
             }
@@ -134,8 +152,10 @@ fn receive_server_messages(
         
         // Liberar el lock entre lecturas
         drop(stream_lock);
-        thread::sleep(std::time::Duration::from_millis(1));
+        thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS
     }
+    
+    info!("🔌 Thread de recepción terminado");
 }
 
 fn process_server_messages(
@@ -153,11 +173,23 @@ fn process_server_messages(
     
     for message in messages {
         match message {
-            ServerMessage::Connected { player_id, tick_rate } => {
+            ServerMessage::Connected { player_id, tick_rate, session_token, spawn_position } => {
                 client.connected = true;
                 client.local_player_id = Some(player_id);
                 info!("🎮 Conectado como jugador {:?}", player_id);
                 info!("⚡ Tick rate del servidor: {} Hz", tick_rate);
+                info!("🔑 Token de sesión recibido: {}", session_token);
+                // TODO: Guardar session_token para reconexión
+            }
+            
+            ServerMessage::AuthError { reason } => {
+                error!("❌ Error de autenticación: {}", reason);
+                // TODO: Mostrar UI de error
+            }
+            
+            ServerMessage::Registered { player_id, session_token } => {
+                info!("✅ Registrado exitosamente como {:?}", player_id);
+                // TODO: Cambiar a pantalla de login
             }
             
             ServerMessage::WorldState { players, .. } => {
@@ -296,16 +328,23 @@ fn send_player_input(
     // Enviar al servidor
     if let Some(stream) = &client.stream {
         if let Ok(mut stream_lock) = stream.lock() {
-            send_client_message(&mut *stream_lock, &message);
+            if let Err(e) = send_client_message(&mut *stream_lock, &message) {
+                warn!("⚠️ Error enviando input al servidor: {}", e);
+                // No rompemos la conexión por un error de envío
+            }
         }
     }
 }
 
-fn send_client_message(stream: &mut TcpStream, message: &ClientMessage) {
+fn send_client_message(stream: &mut TcpStream, message: &ClientMessage) -> Result<(), std::io::Error> {
     if let Ok(json) = serde_json::to_string(message) {
         let len = json.len() as u32;
         let mut data = len.to_be_bytes().to_vec();
         data.extend(json.as_bytes());
-        let _ = stream.write_all(&data);
+        stream.write_all(&data)?;
+        stream.flush()?;
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to serialize message"))
     }
 }
